@@ -11124,17 +11124,27 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
 }
 
-static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
+static int kv_cache_slot_continued_store_len(server *s, server_slot *slot,
+                                               int live_tokens,
+                                               bool clean_prompt_frontier) {
+    const int target = kv_cache_slot_continued_target(s, slot, live_tokens);
+    /* A live tool continuation can begin past the next aligned target. Only a
+     * clean prompt frontier is safe to publish at its current off-grid length. */
+    if (clean_prompt_frontier && target > 0 && target < live_tokens)
+        return live_tokens;
+    return target;
+}
+
+static void kv_cache_maybe_store_continued(server *s, server_slot *slot,
+                                            bool clean_prompt_frontier) {
     if (!s || !slot) return;
-    kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
-    const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
-    if (target == 0) return;
-    if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
-        (void)kc;
-        kv_cache_slot_note_store(slot, target);
-    }
+    const int store_len = kv_cache_slot_continued_store_len(
+        s, slot, tokens->len, clean_prompt_frontier);
+    if (store_len == 0) return;
+    if (kv_cache_store_live_prefix(s, slot, tokens, store_len, "continued"))
+        kv_cache_slot_note_store(slot, store_len);
 }
 
 #ifdef DS4_SERVER_TEST
@@ -12268,7 +12278,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
-            kv_cache_maybe_store_continued(p->srv, p->slot);
+            kv_cache_maybe_store_continued(p->srv, p->slot, false);
         }
         return;
     }
@@ -12314,7 +12324,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && p->slot && current > p->cached_tokens) {
-        kv_cache_maybe_store_continued(p->srv, p->slot);
+        kv_cache_maybe_store_continued(p->srv, p->slot, false);
     }
 }
 
@@ -13412,7 +13422,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    if (!multimodal) kv_cache_maybe_store_continued(s, slot, true);
     const double prefill_duration = now_sec() - t0;
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
@@ -13564,7 +13574,7 @@ decode_again:
               (saw_tool_start || in_tool_call))) {
             /* Streamed generated tokens are provisional until the final write.
              * Prompt-prefill checkpoints were already persisted before decode. */
-            kv_cache_maybe_store_continued(s, slot);
+            kv_cache_maybe_store_continued(s, slot, false);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -19833,6 +19843,23 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 16736) == 16384);
 }
 
+static void test_missed_continued_boundary_uses_clean_prompt_frontier(void) {
+    server s = {0};
+    server_slot slot = {.continued_last_store_tokens = 79093};
+    s.kv.enabled = true;
+    s.kv.opt = kv_cache_default_options();
+    s.kv.opt.continued_interval_tokens = 4096;
+    s.kv.opt.boundary_align_tokens = 2048;
+
+    TEST_ASSERT(kv_cache_slot_continued_store_len(
+                    &s, &slot, 90233, false) == 90112);
+    TEST_ASSERT(kv_cache_slot_continued_store_len(
+                    &s, &slot, 90233, true) == 90233);
+    kv_cache_slot_note_store(&slot, 90233);
+    TEST_ASSERT(kv_cache_slot_continued_store_len(
+                    &s, &slot, 90233, true) == 0);
+}
+
 static void test_off_grid_prefill_stops_on_publishable_frontiers(void) {
     server s = {0};
     server_slot slot = {.continued_last_store_tokens = 10592};
@@ -21346,6 +21373,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_missed_continued_boundary_uses_clean_prompt_frontier();
     test_off_grid_prefill_stops_on_publishable_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
