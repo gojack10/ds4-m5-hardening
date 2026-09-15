@@ -434,6 +434,29 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     kv_le_put64(h + 40, payload_bytes);
 }
 
+bool ds4_kvstore_write_payload(FILE *fp, ds4_session *session,
+                                uint64_t *payload_bytes,
+                                char *err, size_t err_len) {
+    const off_t start = ftello(fp);
+    if (start < 0) return false;
+    if (ds4_session_save_payload(session, fp, err, err_len) != 0 ||
+        fflush(fp) != 0) return false;
+    const off_t end = ftello(fp);
+    if (end < 0) return false;
+    if (end < start) {
+        errno = EIO;
+        return false;
+    }
+    const uint64_t bytes = (uint64_t)(end - start);
+    uint8_t encoded[8];
+    kv_le_put64(encoded, bytes);
+    if (fseeko(fp, 40, SEEK_SET) != 0 ||
+        fwrite(encoded, 1, sizeof(encoded), fp) != sizeof(encoded) ||
+        fseeko(fp, end, SEEK_SET) != 0) return false;
+    *payload_bytes = bytes;
+    return true;
+}
+
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
                              uint32_t *text_bytes) {
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
@@ -1095,56 +1118,11 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     /* Precommit capacity eviction preserves the best recoverable fallback;
      * publication precedes superseding it. */
     if (predicted_payload_bytes != 0) {
-        uint64_t reservation = ds4_kvstore_transient_reservation(
-            predicted_payload_bytes, predicted_required_bytes,
-            kc->budget_bytes);
-        ds4_kvstore_evict(kc, live_tokens, reservation, &precommit);
+        /* Only one on-disk payload now: the unpublished final-directory temp. */
+        ds4_kvstore_evict(kc, live_tokens, predicted_required_bytes, &precommit);
     }
 
-    ds4_session_payload_file staged = {0};
-    if (ds4_session_stage_payload(session, &staged,
-                                  save_err, sizeof(save_err)) != 0) {
-        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
-                kv_log_name(kc),
-                store_tokens.len,
-                reason,
-                save_err[0] ? save_err : "unknown error");
-        if (err && err_len) snprintf(err, err_len, "%s",
-                                     save_err[0] ? save_err : "unknown error");
-        free(text);
-        free(path);
-        ds4_tokens_free(&store_tokens);
-        return false;
-    }
-    uint64_t payload_bytes = staged.bytes;
-
-    uint64_t est_file_bytes = 0, est_required_bytes = 0;
-    if (!ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
-                                    trailer_est_bytes,
-                                    &est_file_bytes, &est_required_bytes)) {
-        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache skipped tokens=%d reason=%s because estimated file size %.2f MiB (%.2f MiB with safety) exceeds budget %.2f MiB",
-                kv_log_name(kc),
-                store_tokens.len,
-                reason,
-                (double)est_file_bytes / (1024.0 * 1024.0),
-                (double)est_required_bytes / (1024.0 * 1024.0),
-                (double)kc->budget_bytes / (1024.0 * 1024.0));
-        ds4_session_payload_file_free(&staged);
-        free(text);
-        free(path);
-        ds4_tokens_free(&store_tokens);
-        return false;
-    }
-
-    if (predicted_payload_bytes == 0) {
-        ds4_kvstore_evict(kc, live_tokens, est_required_bytes, &precommit);
-    } else if (predicted_payload_bytes != payload_bytes) {
-        uint64_t reservation = ds4_kvstore_transient_reservation(
-            payload_bytes, est_required_bytes, kc->budget_bytes);
-        ds4_kvstore_evict(kc, live_tokens, reservation, &precommit);
-    }
+    uint64_t payload_bytes = 0;
 
     kv_buf tmpb = {0};
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
@@ -1156,7 +1134,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 "%s: kv cache failed to create %s: %s save=%.1f ms",
                 kv_log_name(kc), tmp, strerror(errno),
                 (kv_now_sec() - save_t0) * 1000.0);
-        ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         free(path);
@@ -1180,10 +1157,23 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_write_staged_payload(&staged, fp,
-                                               save_err, sizeof(save_err)) == 0 &&
-              kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
-              fflush(fp) == 0;
+              ds4_kvstore_write_payload(fp, session, &payload_bytes,
+                                         save_err, sizeof(save_err));
+    uint64_t est_required_bytes = 0;
+    if (ok && !ds4_kvstore_file_size_fits(kc, (uint64_t)text_len,
+                                          payload_bytes, trailer_est_bytes,
+                                          NULL, &est_required_bytes)) {
+        snprintf(save_err, sizeof(save_err), "measured KV payload exceeds budget");
+        errno = 0;
+        ok = false;
+    }
+    if (ok && (predicted_payload_bytes == 0 ||
+               predicted_payload_bytes != payload_bytes)) {
+        ds4_kvstore_evict(kc, live_tokens, est_required_bytes, &precommit);
+        errno = 0;
+    }
+    if (ok) ok = kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
+                 fflush(fp) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;
@@ -1253,7 +1243,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         };
         ds4_kvstore_evict(kc, live_tokens, 0, &incoming);
     }
-    ds4_session_payload_file_free(&staged);
     free(tmp);
     free(text);
     free(path);

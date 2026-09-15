@@ -210,6 +210,11 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                              uint64_t created_at, uint64_t last_used,
                              uint64_t payload_bytes);
+/* Write at the payload cursor, backpatch the outer header at file offset 40,
+ * and leave the stream at payload end for a trailer. Caller owns publication. */
+bool ds4_kvstore_write_payload(FILE *fp, ds4_session *session,
+                                uint64_t *payload_bytes,
+                                char *err, size_t err_len);
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);

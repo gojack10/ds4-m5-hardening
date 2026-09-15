@@ -4542,16 +4542,8 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
     if (sha_out) memcpy(sha_out, sha, sizeof(sha));
 
-    ds4_session_payload_file staged = {0};
     char save_err[160] = {0};
-    if (ds4_session_stage_payload(w->session, &staged,
-                                  save_err, sizeof(save_err)) != 0) {
-        snprintf(err, err_len, "%s",
-                 save_err[0] ? save_err : "session has no valid KV payload");
-        free(text);
-        return false;
-    }
-    uint64_t payload_bytes = staged.bytes;
+    uint64_t payload_bytes = 0;
 
     agent_buf tmpl = {0};
     agent_buf_puts(&tmpl, path);
@@ -4560,7 +4552,6 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     int fd = mkstemp(tmp);
     if (fd < 0) {
         snprintf(err, err_len, "%s", strerror(errno));
-        ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         return false;
@@ -4571,7 +4562,6 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "%s", strerror(errno));
         close(fd);
         unlink(tmp);
-        ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         return false;
@@ -4591,8 +4581,8 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_write_staged_payload(&staged, fp,
-                                               save_err, sizeof(save_err)) == 0 &&
+              ds4_kvstore_write_payload(fp, w->session, &payload_bytes,
+                                         save_err, sizeof(save_err)) &&
               (!session_identity ||
                agent_kv_write_title_trailer(fp, session_title,
                                             save_err, sizeof(save_err))) &&
@@ -4613,7 +4603,6 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         unlink(tmp);
     }
 
-    ds4_session_payload_file_free(&staged);
     free(tmp);
     free(text);
     return ok;

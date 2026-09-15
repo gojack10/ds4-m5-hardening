@@ -6016,12 +6016,11 @@ static bool parse_glm_generated_message_ex(const char *text,
         return true;
     }
 
+    /* Structured tool calls cannot reconstruct sampled separator bytes. */
+    size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
     const char *raw_block_start = start;
-    if (start >= text + 2 && start[-2] == '\n' && start[-1] == '\n') {
-        raw_block_start = start - 2;
-    }
-    size_t content_len = trim_tool_separator_ws(text, 0,
-                                                (size_t)(raw_block_start - text));
+    while (raw_block_start > text &&
+           isspace((unsigned char)raw_block_start[-1])) raw_block_start--;
     const char *p = start;
     for (;;) {
         p = skip_ascii_ws(p);
@@ -10631,8 +10630,8 @@ static const char *find_next_tool_block(const char *p, const char **end_out) {
                 if (!next_end) break;
                 e = next_end + strlen("</tool_call>");
             }
-            const char *s = glm >= p + 2 && glm[-2] == '\n' && glm[-1] == '\n' ?
-                            glm - 2 : glm;
+            const char *s = glm;
+            while (s > p && isspace((unsigned char)s[-1])) s--;
             if (!best || s < best) {
                 best = s;
                 best_end = e;
@@ -10643,6 +10642,23 @@ static const char *find_next_tool_block(const char *p, const char **end_out) {
     return best;
 }
 
+
+static tool_memory_block *kv_tool_map_find_block_locked(server *s,
+                                                        const char *start,
+                                                        const char **end) {
+    const char *with_ws = skip_ascii_ws(*end);
+    for (;;) {
+        tool_memory_block *b = tool_memory_find_block_locked(
+            &s->tool_mem, start, (size_t)(*end - start));
+        if (!b && with_ws != *end) {
+            b = tool_memory_find_block_locked(
+                &s->tool_mem, start, (size_t)(with_ws - start));
+            if (b) *end = with_ws;
+        }
+        if (b || !isspace((unsigned char)*start)) return b;
+        start++;
+    }
+}
 
 static bool kv_tool_map_measure_locked(server *s, const char *text,
                                        uint32_t *count_out,
@@ -10655,14 +10671,7 @@ static bool kv_tool_map_measure_locked(server *s, const char *text,
         const char *end = NULL;
         const char *start = find_next_tool_block(p, &end);
         if (!start || !end) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
-        const char *with_ws = skip_ascii_ws(end);
-        if (!b && with_ws != end) {
-            b = tool_memory_find_block_locked(&s->tool_mem, start,
-                                              (size_t)(with_ws - start));
-            if (b) end = with_ws;
-        }
+        tool_memory_block *b = kv_tool_map_find_block_locked(s, start, &end);
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
@@ -10729,14 +10738,7 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
         const char *end = NULL;
         const char *start = find_next_tool_block(p, &end);
         if (!start || !end || !ok) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
-        const char *with_ws = skip_ascii_ws(end);
-        if (!b && with_ws != end) {
-            b = tool_memory_find_block_locked(&s->tool_mem, start,
-                                              (size_t)(with_ws - start));
-            if (b) end = with_ws;
-        }
+        tool_memory_block *b = kv_tool_map_find_block_locked(s, start, &end);
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; ok && e; e = e->block_next) {
@@ -11153,6 +11155,10 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
     return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
 }
 #endif
+
+static bool kv_cache_disk_improves_reuse(int memory_tokens, int disk_tokens) {
+    return disk_tokens > memory_tokens;
+}
 
 static bool kv_cache_best_text_prefix_sha(server *s, server_slot *slot,
                                           const char *prompt_text,
@@ -12384,6 +12390,7 @@ typedef struct {
     const char *ctx;
     const char *reason;
     uint64_t trace_id;
+    char *prompt_text;
     char *loaded_path;
     int loaded_tokens;
 } server_abort_recovery;
@@ -12401,16 +12408,22 @@ static void server_abort_clear_live_state(void *ud) {
 
 static bool server_abort_load_clean_prefix(void *ud) {
     server_abort_recovery *r = ud;
-    if (!r->s->kv.enabled || !r->req->prompt_text ||
-        !r->req->prompt_text[0])
+    if (!r->s->kv.enabled || !r->prompt_text || !r->prompt_text[0])
         return false;
 
     /* The request remains broadly cancelled, but recovery I/O itself must not
      * inherit that callback or the clean load would self-cancel. */
     ds4_session_set_cancel(r->slot->session, NULL, NULL);
     r->loaded_tokens = kv_cache_try_load_text(
-        r->s, r->slot, r->req->prompt_text, NULL,
+        r->s, r->slot, r->prompt_text, NULL,
         &r->loaded_path, NULL, r->req->api == API_RESPONSES);
+    /* Visible-key snapshots may omit hidden reasoning. Retain that fallback,
+     * but prefer the actual prompt whose KV was checkpointed before decode. */
+    if (r->loaded_tokens == 0 && r->req->prompt_text &&
+        strcmp(r->prompt_text, r->req->prompt_text))
+        r->loaded_tokens = kv_cache_try_load_text(
+            r->s, r->slot, r->req->prompt_text, NULL,
+            &r->loaded_path, NULL, r->req->api == API_RESPONSES);
     ds4_session_set_cancel(r->slot->session, job_cancelled, r->j);
     return r->loaded_tokens > 0;
 }
@@ -12444,6 +12457,7 @@ static bool restore_clean_prompt_frontier(server *s, server_slot *slot,
         .ctx = ctx,
         .reason = reason,
         .trace_id = trace_id,
+        .prompt_text = render_tokens_text(s->engine, prompt, NULL),
     };
     server_log(DS4_LOG_WARNING,
                "ds4-server: request aborted; restoring clean abort checkpoint ctx=%s prompt=%d reason=\"%s\"",
@@ -12481,6 +12495,7 @@ static bool restore_clean_prompt_frontier(server *s, server_slot *slot,
                     r.loaded_tokens, prompt->len);
     }
     free(r.loaded_path);
+    free(r.prompt_text);
     return ok;
 }
 
@@ -13183,6 +13198,26 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cached = text_cached;
             cache_source = "memory-text";
             prompt_for_sync = &effective_prompt;
+        }
+    }
+    /* A stale batched slot must not hide a newer compatible disk frontier.
+     * Reset the memory selection before loading: a failed payload load can
+     * invalidate the session, so retaining its old cached count is unsafe. */
+    if (!multimodal && s->kv.enabled && cached > 0) {
+        int disk_tokens = 0;
+        kv_cache_best_text_prefix_sha(s, slot, j->req.prompt_text,
+                                      NULL, &disk_tokens);
+        if (kv_cache_disk_improves_reuse(cached, disk_tokens)) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: disk prefix supersedes live reuse memory=%d disk=%d",
+                       cached, disk_tokens);
+            cached = 0;
+            cache_source = "none";
+            prompt_for_sync = &j->req.prompt;
+            effective_prompt.len = 0;
+            responses_live_continuation = false;
+            message_live_continuation = false;
+            thinking_live_continuation = false;
         }
     }
     if (cached == 0 && old_pos > 0) {
@@ -20105,6 +20140,66 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     rmdir(dir);
 }
 
+static void test_disk_prefix_supersedes_stale_memory(void) {
+    TEST_ASSERT(kv_cache_disk_improves_reuse(291562, 322128));
+    TEST_ASSERT(!kv_cache_disk_improves_reuse(322128, 291562));
+    TEST_ASSERT(!kv_cache_disk_improves_reuse(322128, 322128));
+    TEST_ASSERT(!kv_cache_disk_improves_reuse(291562, 0));
+}
+
+static void test_glm_separator_replay_round_trip(void) {
+    const char *separators[] = {"", "\n", "\n\n", "\n\n\n", " \t\r\n"};
+    for (size_t i = 0; i < sizeof(separators) / sizeof(*separators); i++) {
+        buf generated = {0};
+        buf_puts(&generated, "</think>");
+        buf_puts(&generated, separators[i]);
+        buf_puts(&generated, "<tool_call>bash<arg_key>command</arg_key>"
+                            "<arg_value>pwd</arg_value></tool_call>\n");
+        char *content = NULL, *reasoning = NULL;
+        tool_calls calls = {0};
+        TEST_ASSERT(parse_glm_generated_message_ex(generated.ptr, false,
+                    NULL, NULL, &content, &reasoning, &calls));
+        const char *expected = generated.ptr + strlen("</think>");
+        TEST_ASSERT(calls.raw_tool_text != NULL);
+        TEST_ASSERT(!strcmp(calls.raw_tool_text, expected));
+
+        server src = {0}, dst = {0};
+        pthread_mutex_init(&src.tool_mu, NULL);
+        pthread_mutex_init(&dst.tool_mu, NULL);
+        tool_memory_put(&src, "separator_call", calls.raw_tool_text);
+        FILE *fp = tmpfile();
+        TEST_ASSERT(fp != NULL);
+        uint64_t estimated = 0, written = 0;
+        TEST_ASSERT(kv_tool_map_serialized_size(&src, generated.ptr, &estimated));
+        TEST_ASSERT(kv_tool_map_write(&src, fp, generated.ptr, &written));
+        TEST_ASSERT(written > 0 && written == estimated);
+        rewind(fp);
+        TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 1);
+        chat_msgs msgs = {0};
+        chat_msg assistant = {.role = xstrdup("assistant")};
+        tool_call tc = {.id = xstrdup("separator_call"),
+                       .name = xstrdup("bash"), .arguments = xstrdup("{}")};
+        tool_calls_push(&assistant.calls, tc);
+        chat_msgs_push(&msgs, assistant);
+        tool_replay_stats stats = {0};
+        tool_memory_attach_to_messages(&dst, &msgs, &stats);
+        TEST_ASSERT(stats.disk == 1 && stats.missing_ids == 0);
+        TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
+        if (msgs.v[0].calls.raw_tool_text)
+            TEST_ASSERT(!strcmp(msgs.v[0].calls.raw_tool_text, expected));
+        chat_msgs_free(&msgs);
+        fclose(fp);
+        tool_memory_free(&src.tool_mem);
+        tool_memory_free(&dst.tool_mem);
+        pthread_mutex_destroy(&src.tool_mu);
+        pthread_mutex_destroy(&dst.tool_mu);
+        tool_calls_free(&calls);
+        free(content);
+        free(reasoning);
+        buf_free(&generated);
+    }
+}
+
 static void test_kv_tool_block_scanner_recognizes_mixed_syntax(void) {
     const char *text =
         "plain text\n\n"
@@ -21331,6 +21426,8 @@ static void ds4_server_unit_tests_run(void) {
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
+    test_disk_prefix_supersedes_stale_memory();
+    test_glm_separator_replay_round_trip();
     test_kv_tool_block_scanner_recognizes_mixed_syntax();
     test_kv_tool_map_filters_by_checkpoint_text();
     test_kv_glm_tool_map_real_checkpoint_round_trip();
